@@ -1,0 +1,378 @@
+diff --git a/Makefile b/Makefile
+index 0dc346d..0995f68 100755
+--- a/Makefile
++++ b/Makefile
+@@ -217,7 +217,7 @@ sdk:
+ 	$(Q)bash -c "source tools/ci.sh && ci_install_sdk"
+ 
+ submodules:
+-	$(MAKE) -C $(MICROPY_DIR)/ports/$(PORT) BOARD=$(TARGET) submodules
++	$(MAKE) -C $(MICROPY_DIR)/ports/$(PORT) BOARD=$(TARGET) OMV_CMAKE=$(TOP_DIR)/ports/$(PORT)/port_config.cmake submodules
+ 
+ debug: $(ROMFS_IMAGE)
+ ifeq ($(DEBUGGER),NONE)
+diff --git a/common/omv_cycles.h b/common/omv_cycles.h
+index 0f418a0..01ca57e 100644
+--- a/common/omv_cycles.h
++++ b/common/omv_cycles.h
+@@ -37,9 +37,18 @@
+ 
+ void omv_cycles_init(void);
+ 
++#if defined(PICO_RP2040) || defined(PICO_RP2350)
++// Cortex-M0/M0+ has no DWT cycle counter; approximate using the
++// microsecond-resolution hardware timer instead.
++#include "pico/time.h"
++static inline uint32_t omv_cycles_now(void) {
++    return time_us_32() * OMV_CYCLES_PER_US;
++}
++#else
+ static inline uint32_t omv_cycles_now(void) {
+     return DWT->CYCCNT;
+ }
++#endif
+ 
+ static inline uint32_t omv_cycles_to_us(uint32_t cycles) {
+     return cycles / OMV_CYCLES_PER_US;
+diff --git a/ports/rp2/main.c b/ports/rp2/main.c
+index db4d067..f85aaa3 100644
+--- a/ports/rp2/main.c
++++ b/ports/rp2/main.c
+@@ -29,6 +29,7 @@
+ #include "rp2_flash.h"
+ #include "py/compile.h"
+ #include "py/runtime.h"
++#include "py/builtin.h"
+ #include "py/gc.h"
+ #include "py/mperrno.h"
+ #include "py/mphal.h"
+@@ -63,8 +64,7 @@
+ #include "framebuffer.h"
+ #include "omv_i2c.h"
+ #include "omv_csi.h"
+-#include "usbdbg.h"
+-#include "tinyusb_debug.h"
++#include "omv_protocol.h"
+ #include "py_fir.h"
+ #if MICROPY_PY_AUDIO
+ #include "py_audio.h"
+@@ -81,6 +81,11 @@ extern void pendsv_init(void);
+ extern uint8_t __StackTop, __StackBottom;
+ static char OMV_ATTR_SECTION(OMV_ATTR_ALIGNED(gc_heap[OMV_GC_BLOCK0_SIZE], 4), ".heap");
+ 
++#if defined(OMV_UMA_BLOCK0_MEMORY)
++// Reserved by the .uma_pool0 section in the linker script.
++extern uint8_t _uma_pool0_start, _uma_pool0_end;
++#endif
++
+ uint8_t *OMV_BOARD_UID_ADDR;
+ static pico_unique_board_id_t OMV_ATTR_ALIGNED(pico_unique_id, 4);
+ 
+@@ -179,9 +184,12 @@ soft_reset:
+ 
+     pendsv_init();
+     soft_timer_init();
+-    usbdbg_init();
++    omv_protocol_init_default();
+ 
+     uma_init();
++    #if defined(OMV_UMA_BLOCK0_MEMORY)
++    uma_pool_add(&_uma_pool0_start, &_uma_pool0_end - &_uma_pool0_start, OMV_UMA_BLOCK0_FLAGS);
++    #endif
+     framebuffer_init0();
+     #if MICROPY_PY_CSI
+     omv_csi_init0();
+@@ -210,22 +218,19 @@ soft_reset:
+     }
+ 
+     // Run boot.py script.
+-    bool interrupted = mp_exec_bootscript("boot.py", true);
++    bool interrupted = !pyexec_file_if_exists("boot.py");
+ 
+     // Run main.py script on first soft-reset.
+-    if (first_soft_reset && !interrupted && mp_vfs_import_stat("main.py")) {
+-        mp_exec_bootscript("main.py", true);
++    if (first_soft_reset && !interrupted && mp_import_stat("main.py") == MP_IMPORT_STAT_FILE) {
++        pyexec_file_if_exists("main.py");
+         goto soft_reset_exit;
+     }
+ 
+     // If there's no script ready, just re-exec REPL
+-    while (!usbdbg_script_ready()) {
++    while (!omv_protocol_exec_script()) {
+         nlr_buf_t nlr;
+ 
+         if (nlr_push(&nlr) == 0) {
+-            // enable IDE interrupt
+-            usbdbg_set_irq_enabled(true);
+-
+             // run REPL
+             if (pyexec_mode_kind == PYEXEC_MODE_RAW_REPL) {
+                 if (pyexec_raw_repl() != 0) {
+@@ -241,23 +246,9 @@ soft_reset:
+         }
+     }
+ 
+-    if (usbdbg_script_ready()) {
+-        nlr_buf_t nlr;
+-        if (nlr_push(&nlr) == 0) {
+-            // Enable IDE interrupt
+-            usbdbg_set_irq_enabled(true);
+-            // Execute the script.
+-            pyexec_str(usbdbg_get_script(), true);
+-            // Disable IDE interrupts
+-            usbdbg_set_irq_enabled(false);
+-            nlr_pop();
+-        } else {
+-            mp_obj_print_exception(&mp_plat_print, (mp_obj_t) nlr.ret_val);
+-        }
+-    }
+-
+ soft_reset_exit:
+     mp_printf(MP_PYTHON_PRINTER, "MPY: soft reboot\n");
++    omv_protocol_deinit();
+     #if MICROPY_PY_CSI
+     omv_csi_abort_all();
+     #endif
+diff --git a/ports/rp2/mp_config.h b/ports/rp2/mp_config.h
+index 1a15cd9..a7c8e50 100644
+--- a/ports/rp2/mp_config.h
++++ b/ports/rp2/mp_config.h
+@@ -34,6 +34,7 @@
+ #define MICROPY_BANNER_NAME_AND_VERSION "OpenMV " OPENMV_GIT_TAG "; MicroPython " MICROPY_GIT_TAG
+ 
+ #define MICROPY_WRAP_TUD_CDC_RX_CB(name) __mp_ ## name
++#define MICROPY_WRAP_TUD_CDC_LINE_STATE_CB(name) __mp_ ## name
+ #define MICROPY_WRAP_TUD_EVENT_HOOK_CB(name) __mp_ ## name
+ 
+ #include <mpconfigport.h>
+diff --git a/ports/rp2/omv_i2c.c b/ports/rp2/omv_i2c.c
+index a0759e4..17020f4 100644
+--- a/ports/rp2/omv_i2c.c
++++ b/ports/rp2/omv_i2c.c
+@@ -141,6 +141,100 @@ int omv_i2c_write(omv_i2c_t *i2c, uint8_t slv_addr, uint8_t *buf, uint32_t len,
+     return (bytes == len) ? 0 : -1;
+ }
+ 
++int omv_i2c_read_sccb(omv_i2c_t *i2c, uint8_t slv_addr, uint8_t reg_addr, uint8_t *data) {
++    slv_addr = slv_addr >> 1;
++
++    // SCCB protocol requires a STOP between the write and read phases.
++    if (i2c_write_timeout_us(i2c->inst, slv_addr, &reg_addr, 1, false, I2C_TIMEOUT) != 1) {
++        return -1;
++    }
++
++    if (i2c_read_timeout_us(i2c->inst, slv_addr, data, 1, false, I2C_TIMEOUT) != 1) {
++        return -1;
++    }
++
++    return 0;
++}
++
++int omv_i2c_write_sccb(omv_i2c_t *i2c, uint8_t slv_addr, uint8_t reg_addr, uint8_t data) {
++    slv_addr = slv_addr >> 1;
++    uint8_t buf[] = {reg_addr, data};
++
++    if (i2c_write_timeout_us(i2c->inst, slv_addr, buf, 2, false, I2C_TIMEOUT) != 2) {
++        return -1;
++    }
++
++    return 0;
++}
++
++int omv_i2c_read_reg(omv_i2c_t *i2c, uint8_t slv_addr,
++                     uint32_t reg_addr, uint8_t addr_size,
++                     void *data, uint8_t data_size) {
++    slv_addr = slv_addr >> 1;
++
++    uint8_t addr_buf[2];
++    if (addr_size == 1) {
++        addr_buf[0] = reg_addr & 0xFF;
++    } else {
++        addr_buf[0] = (reg_addr >> 8) & 0xFF;
++        addr_buf[1] = reg_addr & 0xFF;
++    }
++
++    if (i2c_write_timeout_us(i2c->inst, slv_addr, addr_buf, addr_size, true, I2C_TIMEOUT) != addr_size) {
++        return -1;
++    }
++
++    uint8_t data_buf[4] = {0};
++    if (i2c_read_timeout_us(i2c->inst, slv_addr, data_buf, data_size, false, I2C_TIMEOUT) != data_size) {
++        return -1;
++    }
++
++    // Convert from big-endian to host byte order
++    uint32_t value = 0;
++    for (int i = 0; i < data_size; i++) {
++        value = (value << 8) | data_buf[i];
++    }
++
++    switch (data_size) {
++        case 1:
++            *(uint8_t *) data = value;
++            break;
++        case 2:
++            *(uint16_t *) data = value;
++            break;
++        case 4:
++            *(uint32_t *) data = value;
++            break;
++    }
++
++    return 0;
++}
++
++int omv_i2c_write_reg(omv_i2c_t *i2c, uint8_t slv_addr,
++                      uint32_t reg_addr, uint8_t addr_size,
++                      uint32_t data, uint8_t data_size) {
++    slv_addr = slv_addr >> 1;
++
++    uint8_t buf[2 + 4];
++    int idx = 0;
++    if (addr_size == 1) {
++        buf[idx++] = reg_addr & 0xFF;
++    } else {
++        buf[idx++] = (reg_addr >> 8) & 0xFF;
++        buf[idx++] = reg_addr & 0xFF;
++    }
++
++    for (int i = 0; i < data_size; i++) {
++        buf[idx++] = (data >> (8 * (data_size - 1 - i))) & 0xFF;
++    }
++
++    if (i2c_write_timeout_us(i2c->inst, slv_addr, buf, idx, false, I2C_TIMEOUT) != idx) {
++        return -1;
++    }
++
++    return 0;
++}
++
+ int omv_i2c_pulse_scl(omv_i2c_t *i2c) {
+     omv_i2c_deinit(i2c);
+ 
+diff --git a/ports/rp2/port_config.cmake b/ports/rp2/port_config.cmake
+index f377a54..33c96ce 100644
+--- a/ports/rp2/port_config.cmake
++++ b/ports/rp2/port_config.cmake
+@@ -24,8 +24,8 @@
+ set(TOP_DIR                 $ENV{TOP_DIR})
+ set(TARGET                  $ENV{TARGET})
+ set(PORT                    rp2)
+-set(BUILD                   ${TOP_DIR}/build/rp2)
+-set(BIN_DIR                 ${TOP_DIR}/build/bin)
++set(BUILD                   ${TOP_DIR}/build/${TARGET}/rp2)
++set(BIN_DIR                 ${TOP_DIR}/build/${TARGET}/bin)
+ set(CMSIS_DIR               lib/cmsis)
+ set(LEPTON_DIR              drivers/lepton)
+ set(LSM6DS3_DIR             drivers/lsm6ds3)
+@@ -54,6 +54,9 @@ target_compile_definitions(${MICROPY_TARGET} PRIVATE
+     ARM_MATH_CM0PLUS
+     ${OMV_BOARD_MODULES_DEFINITIONS}
+     CMSIS_MCU_H="${CMSIS_MCU_H}"
++    OMV_USB_VID=0x2E8A
++    OMV_USB_PID=0x0005
++    OMV_USB_STACK_TINYUSB=1
+ )
+ 
+ target_link_libraries(${MICROPY_TARGET}
+@@ -90,11 +93,13 @@ target_include_directories(${MICROPY_TARGET} PRIVATE
+ 
+     ${TOP_DIR}/
+     ${TOP_DIR}/common/
++    ${TOP_DIR}/protocol/
+     ${TOP_DIR}/modules/
+     ${TOP_DIR}/drivers/sensors/
+     ${TOP_DIR}/ports/${PORT}/
+     ${TOP_DIR}/ports/${PORT}/modules/
+     ${TOP_DIR}/lib/imlib/
++    ${TOP_DIR}/lib/apriltag/
+ 
+     ${TOP_DIR}/${LEPTON_DIR}/include/
+     ${TOP_DIR}/${LSM6DS3_DIR}/include/
+@@ -113,14 +118,17 @@ target_sources(${MICROPY_TARGET} PRIVATE
+     ${TOP_DIR}/common/trace.c
+     ${TOP_DIR}/common/mutex.c
+     ${TOP_DIR}/common/pendsv.c
+-    ${TOP_DIR}/common/usbdbg.c
+-    ${TOP_DIR}/common/tinyusb_debug.c
++    ${TOP_DIR}/protocol/omv_protocol.c
++    ${TOP_DIR}/protocol/omv_protocol_channel_stdio.c
++    ${TOP_DIR}/protocol/omv_protocol_channel_stream.c
++    ${TOP_DIR}/protocol/omv_protocol_channel_profile.c
++    ${TOP_DIR}/protocol/omv_protocol_channel_tinyusb.c
+     ${TOP_DIR}/common/file_utils.c
+     ${TOP_DIR}/common/mp_utils.c
+     ${TOP_DIR}/common/omv_csi.c
+-    ${TOP_DIR}/common/fb_alloc.c
+     ${TOP_DIR}/common/umalloc.c
+-    ${TOP_DIR}/common/dma_alloc.c
++    ${TOP_DIR}/common/tlsf.c
++    ${TOP_DIR}/common/omv_crc.c
+     ${TOP_DIR}/common/memcpy.c
+     ${TOP_DIR}/common/queue.c
+ 
+@@ -171,7 +179,6 @@ target_sources(${MICROPY_TARGET} PRIVATE
+     ${TOP_DIR}/lib/imlib/lab_tab.c
+     ${TOP_DIR}/lib/imlib/lbp.c
+     ${TOP_DIR}/lib/imlib/line.c
+-    ${TOP_DIR}/lib/imlib/lsd.c
+     ${TOP_DIR}/lib/imlib/mathop.c
+     ${TOP_DIR}/lib/imlib/mjpeg.c
+     ${TOP_DIR}/lib/imlib/orb.c
+diff --git a/ports/rp2/rp2.ld.S b/ports/rp2/rp2.ld.S
+index f17893b..79b4f68 100644
+--- a/ports/rp2/rp2.ld.S
++++ b/ports/rp2/rp2.ld.S
+@@ -100,6 +100,14 @@ SECTIONS
+         . = ALIGN(4);
+     } > FLASH
+ 
++    .uma_blocks_table : {
++        . = ALIGN(4);
++        _uma_blocks_table_start = .;
++        KEEP(*(.uma_blocks_table))
++        . = ALIGN(4);
++        _uma_blocks_table_end = .;
++    } > FLASH
++
+     .ARM.extab :
+     {
+         *(.ARM.extab* .gnu.linkonce.armextab.*)
+@@ -196,25 +204,25 @@ SECTIONS
+         _ebss = .;
+     } > RAM
+ 
+-    /* Main framebuffer memory */
+-    .fb_memory (NOLOAD) :
++    /* UMA allocator pool 0 memory */
++    .uma_pool0 (NOLOAD) :
+     {
+       . = ALIGN(4);
+-      _fb_memory_start = .;
+-      . += OMV_FB_SIZE;
++      _uma_pool0_start = .;
++      . += OMV_UMA_BLOCK0_SIZE;
+       . = ALIGN(4);
+-      _fb_memory_end = .;
+-
+-      . += OMV_FB_ALLOC_SIZE;
+-      . = ALIGN(4);
+-      _fb_alloc_end = .;
++      _uma_pool0_end = .;
++    } > RAM
+ 
++    /* IDE streaming buffer (JPEG preview) memory */
++    .sb_memory (NOLOAD) :
++    {
+       . = ALIGN(4);
+       _sb_memory_start = .;
+-      . = . + OMV_SB_SIZE;
++      . += OMV_SB_SIZE;
+       . = ALIGN(4);
+       _sb_memory_end = .;
+-    } >OMV_FB_MEMORY
++    } > RAM
+ 
+     .heap (COPY):
+     {
